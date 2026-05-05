@@ -1,0 +1,11 @@
+[versions]
+agp = "9.1.1"
+kotlin = "2.3.0"
+collectionJvm = "1.5.0"
+[libraries]
+androidx-collection-jvm = { group = "androidx.collection", name = "collection-jvm", version.ref = "collectionJvm" }
+
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }
