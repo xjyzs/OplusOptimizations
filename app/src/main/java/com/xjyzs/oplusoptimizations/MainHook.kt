@@ -353,7 +353,7 @@ class MainHook : IXposedHookLoadPackage {
                             if (windowTitle.contains("GameSpaceFloatWindow")) {
                                 param.result = null
                             }
-                            if (windowTitle.contains("GameFloatMoveBall")) {
+                            if (windowTitle.contains("PanelContainerHandler")) {
                     // 1. 设置全透明 (0.0f 是完全透明，1.0f 是完全不透明)
                     layoutParams.alpha = 0.0f 
                     
