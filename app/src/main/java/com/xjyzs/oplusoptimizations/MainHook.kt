@@ -1,18 +1,16 @@
 package com.xjyzs.oplusoptimizations
 
 import android.app.ActivityOptions
-import android.app.AndroidAppHelper
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
-import android.content.res.Configuration
-import android.content.res.Resources
 import android.graphics.Rect
-import android.graphics.RectF
 import android.os.Bundle
-import android.util.Log
-import android.view.Surface
+import android.os.Handler
+import android.os.IBinder
+import android.os.Message
+import android.view.InputDevice
+import android.view.KeyEvent
 import android.view.View
 import android.view.ViewGroup
 import android.view.WindowManager
@@ -26,6 +24,11 @@ import java.io.File
 
 
 class MainHook : IXposedHookLoadPackage {
+    companion object {
+        private var mWinPressed = false
+        private var mShortcutTriggered = false
+    }
+
     // 判断屏幕方向常量是否为"未指定/跟随类"
     private fun isFromUserGesture(): Boolean {
         val stackTrace = Thread.currentThread().stackTrace
@@ -69,9 +72,32 @@ class MainHook : IXposedHookLoadPackage {
     private var sFullScreenRatio: Float = 0.6923077f
     private val MAGIC_OFFSET = 0.015123f
     private val originalRatioLocal = ThreadLocal<Float>()
+
     // 记录最近一次计算出的设备方向，用于指导后续的小窗数据生成
     private var lastForceLandscape: Boolean = false
     private var lastForcePortrait: Boolean = false
+
+    private fun injectCustomKey(
+        keyCode: Int, action: Int, scanCode: Int, classLoader: ClassLoader?
+    ) {
+        try {
+            val inputManagerClass =
+                XposedHelpers.findClass("android.hardware.input.InputManager", classLoader)
+            val inputManager = XposedHelpers.callStaticMethod(inputManagerClass, "getInstance")
+
+            val now = android.os.SystemClock.uptimeMillis()
+            // 构造新的虚拟按键：
+            // 参数依次为: downTime, eventTime, action, code, repeat, metaState, deviceId, scanCode, flags, source
+            val event = KeyEvent(
+                now, now, action, keyCode, 0, 0, -1, scanCode, 0, InputDevice.SOURCE_KEYBOARD
+            )
+
+            // INJECT_INPUT_EVENT_MODE_ASYNC = 0
+            XposedHelpers.callMethod(inputManager, "injectInputEvent", event, 0)
+        } catch (e: Throwable) {
+            XposedBridge.log("按键注入失败: ${e.message}")
+        }
+    }
 
     override fun handleLoadPackage(lpparam: LoadPackageParam) {
         if (lpparam.packageName == "android") {
@@ -120,10 +146,9 @@ class MainHook : IXposedHookLoadPackage {
                 )
 
                 XposedBridge.hookAllMethods(
-                    targetClass, "getTaskRealSize",
-                    object : XC_MethodHook() {
+                    targetClass, "getTaskRealSize", object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
-                            // 只有目标应用（未指定方向/跟随系统）才进行干预
+                            // 只有目标应用未指定方向才进行干预
                             if (!isUnspecifiedOrientation(sLastOrientation)) return
 
                             val policy = param.thisObject
@@ -136,8 +161,6 @@ class MainHook : IXposedHookLoadPackage {
                                 // 计算设备物理比例（长边/短边，系统会自动处理 >1 还是 <1）
                                 val deviceRatio =
                                     Math.max(sw, sh).toFloat() / Math.min(sw, sh) + 0.03.toFloat()
-
-                                // 【核心】强制让系统认为该应用的横竖屏状态和比例与设备物理状态完全一致！
                                 param.args[0] = isDeviceLandscape
                                 param.args[1] = deviceRatio
                             }
@@ -148,7 +171,8 @@ class MainHook : IXposedHookLoadPackage {
             }
             try {
                 XposedHelpers.findAndHookMethod(
-                    "com.android.server.wm.FlexibleWindowManagerService", lpparam.classLoader,
+                    "com.android.server.wm.FlexibleWindowManagerService",
+                    lpparam.classLoader,
                     "calculateFlexibleWindowBounds",
                     android.content.Intent::class.java,
                     Int::class.java,
@@ -171,16 +195,13 @@ class MainHook : IXposedHookLoadPackage {
                             val sw = XposedHelpers.getIntField(displayInfo, "logicalWidth")
                             val sh = XposedHelpers.getIntField(displayInfo, "logicalHeight")
 
-                            // 核心：注入系统精确的长宽比给渲染层，强制允许缩放
+                            // 注入系统精确的长宽比给渲染层，强制允许缩放
                             val exactRatio =
                                 Math.max(sw, sh).toFloat() / Math.min(sw, sh) + 0.03.toFloat()
                             bundle.putFloat("androidx.flexible.CompatRatio", exactRatio)
                             bundle.putInt("androidx.flexible.ResizeMode", 1)
-
-                            // 去除掉你之前的 bundle.getParcelable<Rect> 和翻转逻辑！
                         }
-                    }
-                )
+                    })
             } catch (e: Throwable) {
                 XposedBridge.log("Hook WMS Error: $e")
             }
@@ -191,7 +212,7 @@ class MainHook : IXposedHookLoadPackage {
                 // 强制手势动画方向与物理设备方向一致
                 val syncOrientationHook = object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        // 关键：只有应用是允许自由旋转时，才修改 isHorizontalApp
+                        // 只有应用是允许自由旋转时，才修改 isHorizontalApp
                         if (isUnspecifiedOrientation(sLastOrientation)) {
                             val policy = param.thisObject
                             val sw = XposedHelpers.getIntField(policy, "mScreenWidth")
@@ -203,7 +224,8 @@ class MainHook : IXposedHookLoadPackage {
 
                 // 纠正动画渲染过程与最终缩放判定
                 XposedHelpers.findAndHookMethod(
-                    policyClass, lpparam.classLoader,
+                    policyClass,
+                    lpparam.classLoader,
                     "updateFourDragAnimSurface",
                     android.view.SurfaceControl.Transaction::class.java,
                     Float::class.javaPrimitiveType,
@@ -212,20 +234,15 @@ class MainHook : IXposedHookLoadPackage {
                 )
 
                 XposedHelpers.findAndHookMethod(
-                    policyClass, lpparam.classLoader,
-                    "getZoomThresholdScale",
-                    syncOrientationHook
+                    policyClass, lpparam.classLoader, "getZoomThresholdScale", syncOrientationHook
                 )
-
-                // 【最关键的一步】：彻底干掉覆盖尺寸的方法！
-                // 拦截 updateRealCropRect，什么都不做，保留动画最后一帧的完美尺寸，无缝移交给 WMS
                 XposedHelpers.findAndHookMethod(
-                    policyClass, lpparam.classLoader,
+                    policyClass,
+                    lpparam.classLoader,
                     "updateRealCropRect",
                     Rect::class.java,
                     object : XC_MethodReplacement() {
                         override fun replaceHookedMethod(param: MethodHookParam): Any? {
-                            // Return null 直接阻断执行，防止它把 432dp 的完美尺寸强行缩小为 360dp
                             return null
                         }
                     })
@@ -233,33 +250,52 @@ class MainHook : IXposedHookLoadPackage {
             } catch (e: Throwable) {
                 XposedBridge.log("Hook Gesture Animation Error: $e")
             }
-        } else if (lpparam.packageName == "com.android.systemui") {
-            // 开启原生剪贴板编辑器
+
+            // 防止 Super 键呼出小布助手
+            val hookedClass = XposedHelpers.findClass(
+                "com.android.server.policy.PhoneWindowManager", lpparam.classLoader
+            )
+
+            var assistHandlerHooked = false
             XposedHelpers.findAndHookMethod(
-                "com.android.systemui.clipboardoverlay.ClipboardListener",
-                lpparam.classLoader,
-                "onPrimaryClipChanged",
+                hookedClass, "interceptKeyBeforeQueueing",
+                KeyEvent::class.java, Int::class.javaPrimitiveType,
                 object : XC_MethodHook() {
                     override fun beforeHookedMethod(param: MethodHookParam) {
-                        isInsideClipboardListener.set(true)
+                        var phoneWindowManagerHandler: Handler? = null
+                        var msgLaunchAssist = -1
+                        if (!assistHandlerHooked) {
+                            try {
+                                phoneWindowManagerHandler = XposedHelpers.getObjectField(
+                                    param.thisObject,
+                                    "mHandler"
+                                ) as Handler
+                                msgLaunchAssist = XposedHelpers.getStaticIntField(
+                                    hookedClass,
+                                    "MSG_LAUNCH_ASSIST"
+                                )
+                                XposedHelpers.findAndHookMethod(
+                                    Message::class.java, "sendToTarget",
+                                    object : XC_MethodHook() {
+                                        override fun beforeHookedMethod(param: MethodHookParam) {
+                                            val msg = param.thisObject as Message
+                                            if (msg.what != msgLaunchAssist) return
+                                            if (msg.target !== phoneWindowManagerHandler) return
+                                            param.result = null
+                                        }
+                                    }
+                                )
+                                assistHandlerHooked = true
+                            } catch (t: Throwable) {
+                                XposedBridge.log("采集 mHandler/MSG_LAUNCH_ASSIST 失败: $t")
+                            }
+                        }
                     }
 
                     override fun afterHookedMethod(param: MethodHookParam) {
-                        isInsideClipboardListener.set(false)
-                    }
-                }
-            )
-            XposedHelpers.findAndHookMethod(
-                XposedHelpers.findClass(
-                    "com.oplusos.systemui.common.feature.FeatureOption",
-                    lpparam.classLoader
-                ),
-                "isExpRegion",
-                object : XC_MethodHook() {
-                    override fun beforeHookedMethod(param: MethodHookParam) {
-                        if (isInsideClipboardListener.get() == true) {
-                            param.result = true
-                        }
+                        val keyEvent = param.args[0] as KeyEvent
+                        if (keyEvent.keyCode != 219) return
+                        param.result = (param.result as Int) or 1  // 强制保留 FLAG_PASS_TO_USER
                     }
                 }
             )
@@ -315,9 +351,7 @@ class MainHook : IXposedHookLoadPackage {
             // 安装完成后不删除 apk
             try {
                 XposedHelpers.findAndHookMethod(
-                    File::class.java,
-                    "delete",
-                    object : XC_MethodHook() {
+                    File::class.java, "delete", object : XC_MethodHook() {
                         override fun beforeHookedMethod(param: MethodHookParam) {
                             val file = param.thisObject as File
                             val path = file.absolutePath
@@ -331,8 +365,7 @@ class MainHook : IXposedHookLoadPackage {
                                 }
                             }
                         }
-                    }
-                )
+                    })
             } catch (t: Throwable) {
                 XposedBridge.log(t)
             }
@@ -354,10 +387,80 @@ class MainHook : IXposedHookLoadPackage {
                                 param.result = null
                             }
                         }
-                    }
-                )
+                    })
             } catch (t: Throwable) {
                 XposedBridge.log(t)
+            }
+        } else if (lpparam.packageName == "com.oplus.screenshot") {
+            // 提高长截图滚动长度限制
+            try {
+                val configClass = XposedHelpers.findClass("t9.b", lpparam.classLoader)
+                // 最大可捕捉页数
+                XposedBridge.hookAllMethods(configClass, "x", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = 63 //TODO
+                    }
+                })
+                // 最大可捕捉像素
+                XposedBridge.hookAllMethods(configClass, "y", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = Integer.MAX_VALUE
+                    }
+                })
+            } catch (t: Throwable) {
+                XposedBridge.log("Failed to hook config limits: " + t.message)
+            }
+
+            // 破解长截图拼接最后一步的Fallback限制
+            try {
+                val stitchLimitUtils = XposedHelpers.findClass("eb.h", lpparam.classLoader)
+
+                XposedBridge.hookAllMethods(stitchLimitUtils, "f", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = false
+                    }
+                })
+                XposedBridge.hookAllMethods(stitchLimitUtils, "g", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = false
+                    }
+                })
+                XposedBridge.hookAllMethods(stitchLimitUtils, "h", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = -1
+                    }
+                })
+            } catch (t: Throwable) {
+                XposedBridge.log("Failed to hook fallback stitch limits: " + t.message)
+            }
+
+            // 自由裁剪模式的最小面积限制
+            try {
+                val lassoPathParser = XposedHelpers.findClass("d7.b", lpparam.classLoader)
+                // 方法 C 负责校验套索面积，返回 true 则允许通过
+                XposedBridge.hookAllMethods(lassoPathParser, "C", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        param.result = true
+                    }
+                })
+            } catch (t: Throwable) {
+                XposedBridge.log("Failed to hook Lasso limit: " + t.message)
+            }
+
+            // 破解常规矩形裁剪模式的最小面积限制
+            try {
+                val abstractEditorInfo = XposedHelpers.findClass(
+                    "f7.c", lpparam.classLoader
+                )
+                // 方法 J 设置最小矩形限制大小
+                XposedBridge.hookAllMethods(abstractEditorInfo, "J", object : XC_MethodHook() {
+                    override fun beforeHookedMethod(param: MethodHookParam) {
+                        XposedBridge.log("Bypassed Rect crop minimum area!")
+                        param.args[0] = 42.0f
+                    }
+                })
+            } catch (t: Throwable) {
+                XposedBridge.log("Failed to hook Rect limit: " + t.message)
             }
         }
     }

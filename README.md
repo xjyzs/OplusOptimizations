@@ -7,3 +7,6 @@ OnePlus Pad 2 Pro (ColorOS 16)
 - 已经有前台应用时，程序坞启动应用将变为小窗启动
 - 自带安装器`com.android.packageinstaller`安装完成后不强制删除 APK
 - 屏蔽游戏启动时的"风驰游戏内核"、"比赛用机"弹窗
+- 提高长截图滚动长度限制
+- 减小截图最小限制
+- 防止 `Super` 键呼出小布

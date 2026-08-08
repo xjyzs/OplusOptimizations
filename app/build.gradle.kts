@@ -5,14 +5,14 @@ plugins {
 
 android {
     namespace = "com.xjyzs.oplusoptimizations"
-    compileSdk = 36
+    compileSdk = 37
 
     defaultConfig {
         applicationId = "com.xjyzs.oplusoptimizations"
         minSdk = 35
         targetSdk = 36
-        versionCode = 1
-        versionName = "1.0"
+        versionCode = 2
+        versionName = "1.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         androidResources. localeFilters+= listOf("zh")
